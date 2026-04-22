@@ -53,6 +53,38 @@ func (app *application) listQrCodesHandler(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+func (app *application) listClaimsHandler(w http.ResponseWriter, r *http.Request) {
+	phone := strings.TrimSpace(r.URL.Query().Get("phone"))
+	serial := strings.TrimSpace(r.URL.Query().Get("serial"))
+	page, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page")))
+	pageSize, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page_size")))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 25
+	}
+
+	items, total, err := app.store.Qrcode.ListClaims(r.Context(), phone, serial, page, pageSize)
+	if err != nil {
+		app.internalServerError(w, r, err)
+		return
+	}
+	totalPages := (total + pageSize - 1) / pageSize
+	resp := map[string]any{
+		"data": items,
+		"meta": map[string]any{
+			"page":        page,
+			"page_size":   pageSize,
+			"total":       total,
+			"total_pages": totalPages,
+		},
+	}
+	if err := app.jsonResponse(w, http.StatusOK, resp); err != nil {
+		app.internalServerError(w, r, err)
+	}
+}
+
 type ActivateQrCodesRequest struct {
 	IDs        []int64 `json:"ids" validate:"required,min=1"`
 	ActiveFrom string  `json:"active_from" validate:"required"`

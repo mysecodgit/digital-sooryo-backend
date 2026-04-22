@@ -41,6 +41,7 @@ type Storage struct {
 		UnassignFromWedding(ctx context.Context, ids []int64, ownerUserID int64) error
 		GetPublicByToken(ctx context.Context, token string) (PublicQrCode, error)
 		ClaimQrCode(context.Context, string, string) (*ClaimResult, error)
+		ListClaims(ctx context.Context, phoneQuery, serialQuery string, page, pageSize int) ([]ClaimRow, int, error)
 	}
 }
 

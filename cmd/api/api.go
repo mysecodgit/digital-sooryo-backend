@@ -90,6 +90,7 @@ func (app *application) mount() http.Handler {
 			r.Put("/wedding", app.updateWeddingHandler)
 
 			r.Get("/qr-codes", app.listQrCodesHandler)
+			r.Get("/claims", app.listClaimsHandler)
 			r.Get("/qr-codes/range", app.listQrCodesRangeHandler)
 			r.Post("/qr-codes/generate", app.generateQrCodesHandler)
 			r.Post("/qr-codes/activate", app.activateQrCodesHandler)

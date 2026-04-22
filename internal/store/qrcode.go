@@ -48,6 +48,14 @@ type ClaimResult struct {
 	Phone        string  `json:"phone"`
 }
 
+// ClaimRow is returned by the claims listing endpoint.
+type ClaimRow struct {
+	ClaimID      int64  `json:"claim_id"`
+	Phone        string `json:"phone"`
+	SerialNumber string `json:"serial_number"`
+	ClaimedAt    string `json:"claimed_at"`
+}
+
 // ClaimQrCode records a claim for the given QR token and phone number.
 func (s *QrcodeStore) ClaimQrCode(ctx context.Context, phone, token string) (*ClaimResult, error) {
 	phone = strings.TrimSpace(phone)
@@ -137,6 +145,82 @@ func (s *QrcodeStore) ClaimQrCode(ctx context.Context, phone, token string) (*Cl
 	}
 
 	return &out, nil
+}
+
+// ListClaims returns claims with optional search and pagination.
+// It reads from the `claims` table and joins `qr_codes` for the serial number.
+func (s *QrcodeStore) ListClaims(ctx context.Context, phoneQuery, serialQuery string, page, pageSize int) ([]ClaimRow, int, error) {
+	phoneQuery = strings.TrimSpace(phoneQuery)
+	serialQuery = strings.TrimSpace(serialQuery)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 25
+	}
+	if pageSize > 200 {
+		pageSize = 200
+	}
+
+	where := ` WHERE 1=1 `
+	args := make([]any, 0, 6)
+	if phoneQuery != "" {
+		where += ` AND c.phone LIKE ? `
+		args = append(args, "%"+phoneQuery+"%")
+	}
+	if serialQuery != "" {
+		where += ` AND qc.serial_number LIKE ? `
+		args = append(args, "%"+serialQuery+"%")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, QueryTimeOutDuration)
+	defer cancel()
+
+	// Total count
+	var total int
+	countQuery := `
+		SELECT COUNT(*)
+		FROM claims c
+		JOIN qr_codes qc ON qc.id = c.qr_id
+	` + where
+	if err := s.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	offset := (page - 1) * pageSize
+	listQuery := `
+		SELECT c.id, c.phone, qc.serial_number, c.claimed_at
+		FROM claims c
+		JOIN qr_codes qc ON qc.id = c.qr_id
+	` + where + `
+		ORDER BY c.claimed_at DESC, c.id DESC
+		LIMIT ? OFFSET ?
+	`
+	listArgs := make([]any, 0, len(args)+2)
+	listArgs = append(listArgs, args...)
+	listArgs = append(listArgs, pageSize, offset)
+
+	rows, err := s.db.QueryContext(ctx, listQuery, listArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]ClaimRow, 0, pageSize)
+	for rows.Next() {
+		var r ClaimRow
+		var claimedAt sql.NullTime
+		if err := rows.Scan(&r.ClaimID, &r.Phone, &r.SerialNumber, &claimedAt); err != nil {
+			return nil, 0, err
+		}
+		if claimedAt.Valid {
+			r.ClaimedAt = claimedAt.Time.Format("2006-01-02 15:04:05")
+		} else {
+			r.ClaimedAt = ""
+		}
+		out = append(out, r)
+	}
+	return out, total, nil
 }
 
 func serialFromUUID() string {
