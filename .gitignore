@@ -1,0 +1,116 @@
+# =========================
+
+# Go build artifacts
+
+# =========================
+
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Build directories
+
+/bin/
+/build/
+/dist/
+/temp/
+
+# =========================
+
+# Go modules (KEEP THESE TRACKED)
+
+# =========================
+
+# DO NOT IGNORE:
+
+# go.mod
+
+# go.sum
+
+# =========================
+
+# Workspace (optional)
+
+# =========================
+
+go.work
+go.work.sum
+
+# =========================
+
+# Vendor (ignore only if not vendoring)
+
+# =========================
+
+vendor/
+
+# =========================
+
+# Logs & temp files
+
+# =========================
+
+*.log
+*.tmp
+*.temp
+*.swp
+
+# =========================
+
+# Environment & secrets
+
+# =========================
+
+.env
+.env.local
+.env.*.local
+.envrc
+# =========================
+
+# OS-generated files
+
+# =========================
+
+.DS_Store
+Thumbs.db
+
+# =========================
+
+# IDE / Editor
+
+# =========================
+
+.vscode/
+.idea/
+*.iml
+
+# =========================
+
+# Test & coverage
+
+# =========================
+
+coverage.out
+*.coverprofile
+
+# =========================
+
+# Docker
+
+# =========================
+
+docker-compose.override.yml
+
+# =========================
+
+# Misc
+
+# =========================
+
+*.bak
+*.orig
+note.txt
