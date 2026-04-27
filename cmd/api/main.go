@@ -25,7 +25,8 @@ func main() {
 			maxIdleTime:  env.GetString("DB_MAX_IDLE_TIME", "15m"),
 		},
 		env:         env.GetString("ENV", "development"),
-		apiURL:      env.GetString("EXTERNAL_URL", "localhost:5075"),
+		// Public base URL of this API, used in QR payloads (should include scheme).
+		apiURL:      env.GetString("EXTERNAL_URL", "http://localhost:5075"),
 		frontendURL: env.GetString("FRONTEND_URL", "http://localhost:5174"),
 		jwtSecret:   env.GetString("JWT_SECRET", "dev-insecure-change-me"),
 		auth: authConfig{

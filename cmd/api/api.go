@@ -65,6 +65,10 @@ func (app *application) mount() http.Handler {
 		MaxAge:           300, // Max age in seconds
 	}))
 
+	// Shortest public redirect used in QR payloads (reduces QR density).
+	// Kept outside /v1 so payload can be `/c/<token>`.
+	r.Get("/c/{token}", app.redirectQrToClaimHandler)
+
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/health", app.checkHealthHandler)
 
@@ -72,6 +76,9 @@ func (app *application) mount() http.Handler {
 		r.Get("/public/wedding/{weddingID}", app.getPublicWeddingHandler)
 		r.Get("/public/qr/{token}", app.getPublicQrHandler)
 		r.Get("/public/qr/{token}/image.png", app.getPublicQrImageHandler)
+		r.Get("/public/qr/{token}/image.svg", app.getPublicQrImageSVGHandler)
+		// Short redirect used by QR payloads to reduce QR density.
+		r.Get("/c/{token}", app.redirectQrToClaimHandler)
 		r.Post("/claim", app.claimQrCodeHandler)
 
 		r.Group(func(r chi.Router) {

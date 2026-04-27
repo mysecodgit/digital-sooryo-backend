@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"time"
@@ -12,32 +14,188 @@ import (
 )
 
 type Qrcode struct {
-	ID           int64    `json:"id"`
-	SerialNumber string   `json:"serial_number"`
-	WeddingID    *int64   `json:"wedding_id"`
-	Token        string   `json:"token"`
-	Amount       float64  `json:"amount"`
-	ActiveFrom   *string  `json:"active_from"`
-	ActiveTo     *string  `json:"active_to"`
-	ActivatedAt  *string  `json:"activated_at"`
-	IsClaimed    bool     `json:"is_claimed"`
-	ClaimedPhone *string  `json:"claimed_phone"`
-	ClaimedAt    *string  `json:"claimed_at"`
-	CreatedAt    string   `json:"created_at"`
+	ID           int64   `json:"id"`
+	SerialNumber string  `json:"serial_number"`
+	ShortCode    string  `json:"short_code"`
+	WeddingID    *int64  `json:"wedding_id"`
+	Token        string  `json:"token"`
+	Amount       float64 `json:"amount"`
+	ActiveFrom   *string `json:"active_from"`
+	ActiveTo     *string `json:"active_to"`
+	ActivatedAt  *string `json:"activated_at"`
+	IsClaimed    bool    `json:"is_claimed"`
+	ClaimedPhone *string `json:"claimed_phone"`
+	ClaimedAt    *string `json:"claimed_at"`
+	CreatedAt    string  `json:"created_at"`
 }
 
 type QrcodeStore struct {
 	db *sql.DB
 }
 
+const shortCodeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+func randomShortCode(n int) (string, error) {
+	if n < 1 {
+		n = 1
+	}
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		out[i] = shortCodeAlphabet[int(b[i])%len(shortCodeAlphabet)]
+	}
+	return string(out), nil
+}
+
+func (s *QrcodeStore) ensureRandomShortCode6(ctx context.Context, token string) (string, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", ErrQrCodeNotFound
+	}
+
+	// Read current code.
+	ctx, cancel := context.WithTimeout(ctx, QueryTimeOutDuration)
+	defer cancel()
+
+	var current sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT short_code FROM qr_codes WHERE token = ? LIMIT 1`, token).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrQrCodeNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	cur := strings.TrimSpace(current.String)
+	if len(cur) == 6 {
+		return cur, nil
+	}
+
+	// Upgrade (or fill) to a random 6-char code, retry on unique collisions.
+	for tries := 0; tries < 300; tries++ {
+		sc, err := randomShortCode(6)
+		if err != nil {
+			return "", err
+		}
+		_, err = s.db.ExecContext(ctx, `UPDATE qr_codes SET short_code = ? WHERE token = ?`, sc, token)
+		if err == nil {
+			return sc, nil
+		}
+		var me *mysql.MySQLError
+		if errors.As(err, &me) && me.Number == 1062 {
+			continue
+		}
+		return "", err
+	}
+
+	return "", ErrConflict
+}
+
+func (s *QrcodeStore) GetShortCodeByToken(ctx context.Context, token string) (string, error) {
+	return s.ensureRandomShortCode6(ctx, token)
+}
+
+func isHexPrefix(s string) bool {
+	if len(s) < 8 || len(s) > 12 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		ok := (c >= '0' && c <= '9') ||
+			(c >= 'a' && c <= 'f') ||
+			(c >= 'A' && c <= 'F')
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// ResolveToken accepts:
+// - full UUID token
+// - base64url short token (22 chars)
+// - short_code (base36 id, collision-free, UNIQUE)
+// - (legacy) hex prefix (8-12 chars) like "d4c2614b"
+// and resolves it to the stored UUID token.
+func (s *QrcodeStore) ResolveToken(ctx context.Context, tokenOrShort string) (string, error) {
+	x := strings.TrimSpace(tokenOrShort)
+	if x == "" {
+		return "", ErrQrCodeNotFound
+	}
+
+	// Full UUID?
+	if _, err := uuid.Parse(x); err == nil {
+		return x, nil
+	}
+
+	// Base64url short token?
+	if b, err := base64.RawURLEncoding.DecodeString(x); err == nil && len(b) == 16 {
+		if u, err := uuid.FromBytes(b); err == nil {
+			return u.String(), nil
+		}
+	}
+
+	// Collision-free short_code (base36 of id).
+	// Prefer exact match, it's indexed and guaranteed unique.
+	{
+		ctx, cancel := context.WithTimeout(ctx, QueryTimeOutDuration)
+		defer cancel()
+
+		var t string
+		err := s.db.QueryRowContext(ctx, `SELECT token FROM qr_codes WHERE short_code = ? LIMIT 1`, x).Scan(&t)
+		if err == nil && strings.TrimSpace(t) != "" {
+			return strings.TrimSpace(t), nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
+
+	// Hex prefix?
+	if !isHexPrefix(x) {
+		return x, nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, QueryTimeOutDuration)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, `SELECT token FROM qr_codes WHERE token LIKE ? LIMIT 2`, x+"%")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	out := make([]string, 0, 2)
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return "", err
+		}
+		out = append(out, strings.TrimSpace(t))
+	}
+	if len(out) == 0 {
+		return "", ErrQrCodeNotFound
+	}
+	if len(out) > 1 {
+		// Prefix collision.
+		return "", ErrConflict
+	}
+	if out[0] == "" {
+		return "", ErrQrCodeNotFound
+	}
+	return out[0], nil
+}
+
 type PublicQrCode struct {
-	SerialNumber string   `json:"serial_number"`
-	Amount       float64  `json:"amount"`
-	Status       string   `json:"status"` // inactive | active | expired | claimed
-	ActiveFrom   *string  `json:"active_from"`
-	ActiveTo     *string  `json:"active_to"`
-	ClaimedPhone *string  `json:"claimed_phone"`
-	ClaimedAt    *string  `json:"claimed_at"`
+	SerialNumber string  `json:"serial_number"`
+	Amount       float64 `json:"amount"`
+	Status       string  `json:"status"` // inactive | active | expired | claimed
+	ActiveFrom   *string `json:"active_from"`
+	ActiveTo     *string `json:"active_to"`
+	ClaimedPhone *string `json:"claimed_phone"`
+	ClaimedAt    *string `json:"claimed_at"`
 }
 
 // ClaimResult is returned after a successful claim.
@@ -258,6 +416,23 @@ func (s *QrcodeStore) GenerateBatchQrCodes(ctx context.Context, count int, amoun
 				return err
 			}
 
+			// Random 6-char short code (unique in DB, retry on collision).
+			for tries := 0; tries < 300; tries++ {
+				sc, err := randomShortCode(6)
+				if err != nil {
+					return err
+				}
+				_, err = tx.ExecContext(ctx, `UPDATE qr_codes SET short_code = ? WHERE id = ?`, sc, id)
+				if err == nil {
+					break
+				}
+				var me *mysql.MySQLError
+				if errors.As(err, &me) && me.Number == 1062 {
+					continue
+				}
+				return err
+			}
+
 			var serial string
 			err = tx.QueryRowContext(ctx, `SELECT serial_number FROM qr_codes WHERE id = ?`, id).Scan(&serial)
 			if err != nil {
@@ -456,7 +631,7 @@ func (s *QrcodeStore) GetByIDs(ctx context.Context, ids []int64) ([]Qrcode, erro
 	}
 
 	query := `
-		SELECT id, serial_number, wedding_id, token, amount, active_from, active_to, activated_at, is_claimed, claimed_phone, claimed_at, created_at
+		SELECT id, serial_number, short_code, wedding_id, token, amount, active_from, active_to, activated_at, is_claimed, claimed_phone, claimed_at, created_at
 		FROM qr_codes
 		WHERE id IN (` + strings.Join(placeholders, ",") + `)
 		ORDER BY serial_number ASC
@@ -483,6 +658,7 @@ func (s *QrcodeStore) GetByIDs(ctx context.Context, ids []int64) ([]Qrcode, erro
 		err := rows.Scan(
 			&qrcode.ID,
 			&qrcode.SerialNumber,
+			&qrcode.ShortCode,
 			&weddingID,
 			&qrcode.Token,
 			&qrcode.Amount,
@@ -542,7 +718,7 @@ func (s *QrcodeStore) GetBySerialRange(ctx context.Context, fromSerial, toSerial
 	}
 
 	query := `
-		SELECT id, serial_number, wedding_id, token, amount, active_from, active_to, activated_at, is_claimed, claimed_phone, claimed_at, created_at
+		SELECT id, serial_number, short_code, wedding_id, token, amount, active_from, active_to, activated_at, is_claimed, claimed_phone, claimed_at, created_at
 		FROM qr_codes
 		WHERE serial_number >= ? AND serial_number <= ?
 	`
@@ -574,6 +750,7 @@ func (s *QrcodeStore) GetBySerialRange(ctx context.Context, fromSerial, toSerial
 		err := rows.Scan(
 			&qrcode.ID,
 			&qrcode.SerialNumber,
+			&qrcode.ShortCode,
 			&weddingID,
 			&qrcode.Token,
 			&qrcode.Amount,
@@ -704,7 +881,7 @@ func (s *QrcodeStore) GetPublicByToken(ctx context.Context, token string) (Publi
 // GetAll returns all QR codes (most recent first).
 func (s *QrcodeStore) GetAll(ctx context.Context) ([]Qrcode, error) {
 	query := `
-		SELECT id, serial_number, wedding_id, token, amount, active_from, active_to, activated_at, is_claimed, claimed_phone, claimed_at, created_at
+		SELECT id, serial_number, short_code, wedding_id, token, amount, active_from, active_to, activated_at, is_claimed, claimed_phone, claimed_at, created_at
 		FROM qr_codes
 		ORDER BY id DESC
 	`
@@ -729,6 +906,7 @@ func (s *QrcodeStore) GetAll(ctx context.Context) ([]Qrcode, error) {
 		err := rows.Scan(
 			&qrcode.ID,
 			&qrcode.SerialNumber,
+			&qrcode.ShortCode,
 			&weddingID,
 			&qrcode.Token,
 			&qrcode.Amount,

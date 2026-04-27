@@ -23,7 +23,21 @@ func (app *application) claimQrCodeHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	result, err := app.store.Qrcode.ClaimQrCode(r.Context(), req.Phone, req.Token)
+	// Accept UUID, base64url short token, or hex prefix (8-12 chars).
+	token, err := app.store.Qrcode.ResolveToken(r.Context(), req.Token)
+	if err != nil {
+		switch err {
+		case store.ErrQrCodeNotFound:
+			app.notFoundMessage(w, r, store.ErrQrCodeNotFound.Error())
+		case store.ErrConflict:
+			app.conflictResponse(w, r, err)
+		default:
+			app.internalServerError(w, r, err)
+		}
+		return
+	}
+
+	result, err := app.store.Qrcode.ClaimQrCode(r.Context(), req.Phone, token)
 	if err != nil {
 		switch err {
 		case store.ErrQrCodeNotFound:

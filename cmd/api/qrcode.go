@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jung-kurt/gofpdf"
 	"github.com/mysecodgit/go_accounting/internal/store"
 	"github.com/skip2/go-qrcode"
@@ -18,6 +21,49 @@ import (
 type GenerateQrCodesRequest struct {
 	Count  int     `json:"count" validate:"required,gt=0,lte=500"`
 	Amount float64 `json:"amount" validate:"required,gte=0"`
+}
+
+func encodeShortToken(uuidToken string) (string, bool) {
+	u, err := uuid.Parse(strings.TrimSpace(uuidToken))
+	if err != nil {
+		return "", false
+	}
+	// 16 bytes => 22 chars base64url (no padding)
+	return base64.RawURLEncoding.EncodeToString(u[:]), true
+}
+
+func tokenPrefix8(uuidToken string) string {
+	uuidToken = strings.TrimSpace(uuidToken)
+	if uuidToken == "" {
+		return ""
+	}
+	// UUID tokens are like "aaaaaaaa-bbbb-...." – prefix before the first dash is 8 hex chars.
+	if i := strings.IndexByte(uuidToken, '-'); i > 0 {
+		if i >= 8 {
+			return uuidToken[:8]
+		}
+		return uuidToken[:i]
+	}
+	if len(uuidToken) > 8 {
+		return uuidToken[:8]
+	}
+	return uuidToken
+}
+
+func normalizeAbsoluteBaseURL(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return strings.TrimRight(s, "/")
+	}
+	// Default to http for localhost, https otherwise.
+	low := strings.ToLower(s)
+	if strings.HasPrefix(low, "localhost") || strings.HasPrefix(low, "127.") || strings.HasPrefix(low, "0.0.0.0") {
+		return "http://" + strings.TrimRight(s, "/")
+	}
+	return "https://" + strings.TrimRight(s, "/")
 }
 
 func (app *application) generateQrCodesHandler(w http.ResponseWriter, r *http.Request) {
@@ -240,7 +286,18 @@ func (app *application) unassignQrCodesHandler(w http.ResponseWriter, r *http.Re
 }
 
 func (app *application) getPublicQrHandler(w http.ResponseWriter, r *http.Request) {
-	token := chi.URLParam(r, "token")
+	token, err := app.store.Qrcode.ResolveToken(r.Context(), chi.URLParam(r, "token"))
+	if err != nil {
+		switch err {
+		case store.ErrQrCodeNotFound:
+			app.notFoundMessage(w, r, store.ErrQrCodeNotFound.Error())
+		case store.ErrConflict:
+			app.conflictResponse(w, r, err)
+		default:
+			app.internalServerError(w, r, err)
+		}
+		return
+	}
 	info, err := app.store.Qrcode.GetPublicByToken(r.Context(), token)
 	if err != nil {
 		switch err {
@@ -257,9 +314,21 @@ func (app *application) getPublicQrHandler(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-func (app *application) getPublicQrImageHandler(w http.ResponseWriter, r *http.Request) {
-	token := chi.URLParam(r, "token")
-	_, err := app.store.Qrcode.GetPublicByToken(r.Context(), token)
+func (app *application) redirectQrToClaimHandler(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(chi.URLParam(r, "token"))
+	token, err := app.store.Qrcode.ResolveToken(r.Context(), raw)
+	if err != nil {
+		switch err {
+		case store.ErrQrCodeNotFound:
+			app.notFoundMessage(w, r, store.ErrQrCodeNotFound.Error())
+		case store.ErrConflict:
+			app.conflictResponse(w, r, err)
+		default:
+			app.internalServerError(w, r, err)
+		}
+		return
+	}
+	_, err = app.store.Qrcode.GetPublicByToken(r.Context(), token)
 	if err != nil {
 		switch err {
 		case store.ErrQrCodeNotFound:
@@ -270,14 +339,103 @@ func (app *application) getPublicQrImageHandler(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	base := strings.TrimRight(strings.TrimSpace(app.config.frontendURL), "/")
+	// Always redirect to claim page using collision-free short_code.
+	outToken := raw
+	if sc, err := app.store.Qrcode.GetShortCodeByToken(r.Context(), token); err == nil && strings.TrimSpace(sc) != "" {
+		outToken = sc
+	}
+
+	base := normalizeAbsoluteBaseURL(app.config.frontendURL)
 	if base == "" {
 		base = "http://localhost:5174"
 	}
+	dst := base + "/claim?t=" + url.QueryEscape(outToken)
 
-	claimURL := base + "/claim?t=" + url.QueryEscape(strings.TrimSpace(token))
+	// Redirect + HTML fallback (some scanner webviews don't follow 302 reliably).
+	w.Header().Set("Location", dst)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusFound)
+	_, _ = w.Write([]byte(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="refresh" content="0; url=` + dst + `" />
+    <title>Redirecting…</title>
+  </head>
+  <body>
+    <script>window.location.replace(` + "`" + dst + "`" + `);</script>
+    <p>Redirecting… <a href="` + dst + `">Continue</a></p>
+  </body>
+</html>`))
+}
 
-	png, err := qrcode.Encode(claimURL, qrcode.Medium, 240)
+func (app *application) getPublicQrImageHandler(w http.ResponseWriter, r *http.Request) {
+	// Resolve any incoming token to the canonical UUID, then fetch the QR record again
+	// to obtain its collision-free short_code for the QR payload.
+	token, err := app.store.Qrcode.ResolveToken(r.Context(), chi.URLParam(r, "token"))
+	if err != nil {
+		switch err {
+		case store.ErrQrCodeNotFound:
+			app.notFoundMessage(w, r, store.ErrQrCodeNotFound.Error())
+		case store.ErrConflict:
+			app.conflictResponse(w, r, err)
+		default:
+			app.internalServerError(w, r, err)
+		}
+		return
+	}
+	_, err = app.store.Qrcode.GetPublicByToken(r.Context(), token)
+	if err != nil {
+		switch err {
+		case store.ErrQrCodeNotFound:
+			app.notFoundMessage(w, r, store.ErrQrCodeNotFound.Error())
+		default:
+			app.internalServerError(w, r, err)
+		}
+		return
+	}
+
+	// Shorter payload => fewer QR modules ("dots") => easier scanning.
+	apiBase := normalizeAbsoluteBaseURL(app.config.apiURL)
+	if apiBase == "" {
+		apiBase = "http://localhost:5075"
+	}
+	short, err := app.store.Qrcode.GetShortCodeByToken(r.Context(), token)
+	if err != nil {
+		app.internalServerError(w, r, err)
+		return
+	}
+	claimURL := apiBase + "/c/" + url.PathEscape(strings.TrimSpace(short))
+
+	// Allow requesting a larger QR code (useful for printing).
+	// `s`/`size` is the PNG pixel size, clamped to a safe range.
+	size := 900
+	if qs := strings.TrimSpace(r.URL.Query().Get("s")); qs != "" {
+		if n, err := strconv.Atoi(qs); err == nil {
+			size = n
+		}
+	} else if qs := strings.TrimSpace(r.URL.Query().Get("size")); qs != "" {
+		if n, err := strconv.Atoi(qs); err == nil {
+			size = n
+		}
+	}
+	if size < 120 {
+		size = 120
+	}
+	if size > 1024 {
+		size = 1024
+	}
+
+	// Low error correction reduces density. Disable built-in quiet-zone so we don't get a big white border.
+	qr, err := qrcode.New(claimURL, qrcode.Low)
+	if err != nil {
+		app.internalServerError(w, r, err)
+		return
+	}
+	qr.DisableBorder = true
+	png, err := qr.PNG(size)
 	if err != nil {
 		app.internalServerError(w, r, err)
 		return
@@ -287,6 +445,106 @@ func (app *application) getPublicQrImageHandler(w http.ResponseWriter, r *http.R
 	w.Header().Set("Cache-Control", "public, max-age=300") // 5 min
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(png)
+}
+
+func qrSVGPayload(data string, level qrcode.RecoveryLevel, quietZoneModules int) (string, error) {
+	qr, err := qrcode.New(data, level)
+	if err != nil {
+		return "", err
+	}
+	bm := qr.Bitmap()
+	n := len(bm)
+	if n == 0 {
+		return "", fmt.Errorf("empty qr bitmap")
+	}
+
+	// Quiet zone is provided by the card's white padding; keep SVG tight.
+	qz := quietZoneModules
+	size := n + qz*2
+
+	var b strings.Builder
+	b.Grow(size * size)
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+	b.WriteString(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 `)
+	b.WriteString(strconv.Itoa(size))
+	b.WriteString(` `)
+	b.WriteString(strconv.Itoa(size))
+	b.WriteString(`" shape-rendering="crispEdges" preserveAspectRatio="xMidYMid meet">`)
+	// Transparent background; the print card provides the white QR panel.
+	b.WriteString(`<g fill="#000">`)
+
+	for y := 0; y < n; y++ {
+		row := bm[y]
+		// Pack consecutive black modules into wider rects for smaller SVG.
+		for x := 0; x < n; {
+			if !row[x] {
+				x++
+				continue
+			}
+			start := x
+			for x < n && row[x] {
+				x++
+			}
+			w := x - start
+			b.WriteString(`<rect x="`)
+			b.WriteString(strconv.Itoa(start + qz))
+			b.WriteString(`" y="`)
+			b.WriteString(strconv.Itoa(y + qz))
+			b.WriteString(`" width="`)
+			b.WriteString(strconv.Itoa(w))
+			b.WriteString(`" height="1"/>`)
+		}
+	}
+
+	b.WriteString(`</g></svg>`)
+	return b.String(), nil
+}
+
+func (app *application) getPublicQrImageSVGHandler(w http.ResponseWriter, r *http.Request) {
+	token, err := app.store.Qrcode.ResolveToken(r.Context(), chi.URLParam(r, "token"))
+	if err != nil {
+		switch err {
+		case store.ErrQrCodeNotFound:
+			app.notFoundMessage(w, r, store.ErrQrCodeNotFound.Error())
+		case store.ErrConflict:
+			app.conflictResponse(w, r, err)
+		default:
+			app.internalServerError(w, r, err)
+		}
+		return
+	}
+	_, err = app.store.Qrcode.GetPublicByToken(r.Context(), token)
+	if err != nil {
+		switch err {
+		case store.ErrQrCodeNotFound:
+			app.notFoundMessage(w, r, store.ErrQrCodeNotFound.Error())
+		default:
+			app.internalServerError(w, r, err)
+		}
+		return
+	}
+
+	apiBase := normalizeAbsoluteBaseURL(app.config.apiURL)
+	if apiBase == "" {
+		apiBase = "http://localhost:5075"
+	}
+	short, err := app.store.Qrcode.GetShortCodeByToken(r.Context(), token)
+	if err != nil {
+		app.internalServerError(w, r, err)
+		return
+	}
+	claimURL := apiBase + "/c/" + url.PathEscape(strings.TrimSpace(short))
+
+	svg, err := qrSVGPayload(claimURL, qrcode.Low, 0)
+	if err != nil {
+		app.internalServerError(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(svg))
 }
 
 type ExportQrCodesPDFRequest struct {
@@ -406,8 +664,22 @@ func (app *application) exportQrCodesPDFHandler(w http.ResponseWriter, r *http.R
 		if base == "" {
 			base = "http://localhost:5174"
 		}
-		claimURL := base + "/claim?t=" + url.QueryEscape(strings.TrimSpace(qr.Token))
-		png, err := qrcode.Encode(claimURL, qrcode.Medium, 240)
+		apiBase := normalizeAbsoluteBaseURL(app.config.apiURL)
+		if apiBase == "" {
+			apiBase = "http://localhost:5075"
+		}
+		uuidToken := strings.TrimSpace(qr.Token)
+		short, err := app.store.Qrcode.GetShortCodeByToken(ctx, uuidToken)
+		if err != nil {
+			return err
+		}
+		claimURL := apiBase + "/c/" + url.PathEscape(strings.TrimSpace(short))
+		qrImg, err := qrcode.New(claimURL, qrcode.Low)
+		if err != nil {
+			return err
+		}
+		qrImg.DisableBorder = true
+		png, err := qrImg.PNG(900)
 		if err != nil {
 			return err
 		}

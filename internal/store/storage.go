@@ -39,6 +39,8 @@ type Storage struct {
 		Activate(ctx context.Context, ids []int64, activeFrom, activeTo time.Time) error
 		AssignToWedding(ctx context.Context, ids []int64, weddingID int64) error
 		UnassignFromWedding(ctx context.Context, ids []int64, ownerUserID int64) error
+		ResolveToken(ctx context.Context, tokenOrShort string) (string, error)
+		GetShortCodeByToken(ctx context.Context, token string) (string, error)
 		GetPublicByToken(ctx context.Context, token string) (PublicQrCode, error)
 		ClaimQrCode(context.Context, string, string) (*ClaimResult, error)
 		ListClaims(ctx context.Context, phoneQuery, serialQuery string, page, pageSize int) ([]ClaimRow, int, error)
