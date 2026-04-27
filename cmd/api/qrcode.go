@@ -398,16 +398,19 @@ func (app *application) getPublicQrImageHandler(w http.ResponseWriter, r *http.R
 	}
 
 	// Shorter payload => fewer QR modules ("dots") => easier scanning.
-	apiBase := normalizeAbsoluteBaseURL(app.config.apiURL)
-	if apiBase == "" {
-		apiBase = "http://localhost:5075"
-	}
 	short, err := app.store.Qrcode.GetShortCodeByToken(r.Context(), token)
 	if err != nil {
 		app.internalServerError(w, r, err)
 		return
 	}
-	claimURL := apiBase + "/c/" + url.PathEscape(strings.TrimSpace(short))
+
+	// Encode the FRONTEND claim URL directly so scanners show the app domain,
+	// while keeping the payload short via short_code.
+	frontendBase := normalizeAbsoluteBaseURL(app.config.frontendURL)
+	if frontendBase == "" {
+		frontendBase = "http://localhost:5174"
+	}
+	claimURL := frontendBase + "/claim?t=" + url.QueryEscape(strings.TrimSpace(short))
 
 	// Allow requesting a larger QR code (useful for printing).
 	// `s`/`size` is the PNG pixel size, clamped to a safe range.
@@ -524,16 +527,17 @@ func (app *application) getPublicQrImageSVGHandler(w http.ResponseWriter, r *htt
 		return
 	}
 
-	apiBase := normalizeAbsoluteBaseURL(app.config.apiURL)
-	if apiBase == "" {
-		apiBase = "http://localhost:5075"
-	}
 	short, err := app.store.Qrcode.GetShortCodeByToken(r.Context(), token)
 	if err != nil {
 		app.internalServerError(w, r, err)
 		return
 	}
-	claimURL := apiBase + "/c/" + url.PathEscape(strings.TrimSpace(short))
+
+	frontendBase := normalizeAbsoluteBaseURL(app.config.frontendURL)
+	if frontendBase == "" {
+		frontendBase = "http://localhost:5174"
+	}
+	claimURL := frontendBase + "/claim?t=" + url.QueryEscape(strings.TrimSpace(short))
 
 	svg, err := qrSVGPayload(claimURL, qrcode.Low, 0)
 	if err != nil {
@@ -673,7 +677,11 @@ func (app *application) exportQrCodesPDFHandler(w http.ResponseWriter, r *http.R
 		if err != nil {
 			return err
 		}
-		claimURL := apiBase + "/c/" + url.PathEscape(strings.TrimSpace(short))
+		frontendBase := normalizeAbsoluteBaseURL(app.config.frontendURL)
+		if frontendBase == "" {
+			frontendBase = "http://localhost:5174"
+		}
+		claimURL := frontendBase + "/claim?t=" + url.QueryEscape(strings.TrimSpace(short))
 		qrImg, err := qrcode.New(claimURL, qrcode.Low)
 		if err != nil {
 			return err
