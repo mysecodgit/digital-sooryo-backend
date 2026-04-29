@@ -389,8 +389,8 @@ func serialFromUUID() string {
 // GenerateBatchQrCodes creates inactive QR codes that can later be activated.
 func (s *QrcodeStore) GenerateBatchQrCodes(ctx context.Context, count int, amount float64) ([]Qrcode, error) {
 	query := `
-		INSERT INTO qr_codes (serial_number, token, amount, active_from, active_to, activated_at, is_claimed, claimed_at, created_at)
-		VALUES (?, ?, ?, NULL, NULL, NULL, 0, NULL, NOW())
+		INSERT INTO qr_codes (serial_number,short_code, token, amount, active_from, active_to, activated_at, is_claimed, claimed_at, created_at)
+		VALUES (?,?, ?, ?, NULL, NULL, NULL, 0, NULL, NOW())
 	`
 	ctx, cancel := context.WithTimeout(ctx, QueryTimeOutDuration)
 	defer cancel()
@@ -401,7 +401,8 @@ func (s *QrcodeStore) GenerateBatchQrCodes(ctx context.Context, count int, amoun
 			token := uuid.New().String()
 			// Insert a temporary unique serial, then replace with a sequential one based on the row ID.
 			tmpSerial := "TMP" + strings.ToUpper(strings.ReplaceAll(uuid.New().String(), "-", "")[:16])
-			res, err := tx.ExecContext(ctx, query, tmpSerial, token, amount)
+			tmpShortCode := "TMP" + strings.ToUpper(strings.ReplaceAll(uuid.New().String(), "-", "")[:6])
+			res, err := tx.ExecContext(ctx, query, tmpSerial, tmpShortCode, token, amount)
 			if err != nil {
 				return err
 			}
